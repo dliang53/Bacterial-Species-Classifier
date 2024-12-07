@@ -1,0 +1,468 @@
+---
+title: "Assignment 5"
+author: "Derick Liang"
+date: "2024-12-01"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+#Load packages required for data analysis 
+library(tidyverse)
+library(viridis)
+library(randomForest) #For develop random forest model
+library(Biostrings)
+library(rentrez) #For NCBI data retrival
+library(caret) #For confusionMatrix() function to develop a confusion matrix
+library(class) #For developing K-NN
+library(gbm) #For developing Gradient boosting machines model
+
+#Surpress any warning messages
+options(warn = -1)  # Suppress all warnings
+
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("rename", "dplyr")
+```
+
+# Introudction 
+  The accurate identification and classification of bacterial species are essential for understanding microbial communities, improving disease diagnostics, and ensuring food safety. Bacteria such as Escherichia coli (E. coli), Listeria monocytogenes (Listeria), and Salmonella enterica (Salmonella) are of particular importance due to their roles in human health, agriculture, and biotechnology. While some strains are harmless or beneficial, others are pathogenic and responsible for severe illnesses and foodborne outbreaks worldwide (Sharma et al., 2024). Advancements in sequencing technologies, such as 16S rRNA gene sequencing, have provided a powerful tool for bacterial identification, allowing for faster and more precise analyses (Bertolo et al., 2024). These developments are societally relevant as it can mitigate agricultural losses and contribute to the global fight against antimicrobial resistance.
+  
+  While 16S rRNA sequencing is a widely adopted method for bacterial classification, the computational strategies used to analyze these data significantly impact the accuracy of species identification. Selecting appropriate machine learning algorithms is critical for achieving reliable classification, particularly for closely related species like E. coli, Listeria, and Salmonella. This gap in knowledge highlights the need for systematic evaluations of machine learning classifiers to determine their relative strengths and limitations in bacterial classification tasks (Zieliński et al., 2017). Such evaluations are vital for developing robust tools that can address the challenges posed by overlapping sequence features among bacterial species.
+  
+  The objective of this study is to evaluate and compare the performance of three machine learning classifiers—Random Forest, k-Nearest Neighbors (k-NN), and Gradient Boosting Machines (GBM) in accurately classifying E. coli, Listeria, and Salmonella using 16S rRNA sequence data. This study aims to identify the most effective classification model for this task. Using NCBI datasets and performance metrics to train and validate the models, this project will evaluate the predictive accuracy of these algorithms in distinguishing bacterial species based on 16S rRNA sequence variations.
+
+
+# Description of Data
+The dataset analyzed in this study consists of 16S rRNA sequence data for three bacterial species: E. coli, Listeria, and Salmonella. This dataset was selected to explore the effectiveness of various machine learning classifiers for bacterial identification and classification, addressing the broader question of how to accurately distinguish closely related bacterial species using sequencing data. The sequence data was obtained from the NCBI Nucleotide Database on December 1, 2024 using the Bioconductor rentrez package and extracted using the function provided by Jacqueline May. The sequences were fetched by searching for "Bacterial Species[ORGN] AND 16s [Title] AND Specific Species[PORGN]." The resulting FASTA files  of E. coli, Litersia and Samonella contained 11,801, 3,063 and 1,237 samples respectively. From these files, the key variables of interest are the sequence length and species label as those are what will be used and altered to develop the machine learning models. The three groups correspond to the three bacterial species, and the study compares their sequence length distributions and classification accuracy across models.
+
+Data Citaiton: NCBI Resource Coordinators. Database resources of the National Center for Biotechnology Information. Nucleic Acids Research. 2023.
+
+
+```{r}
+#Function to extract fasta files from NCBI. Code and comments adotped from Jacqueline May. 
+FetchFastaFiles <- function(searchTerm, seqsPerFile = 100, fastaFileName) {
+  
+  # This function will fetch FASTA files from NCBI nuccore based on a provided search term.
+  
+  # searchTerm = character vector containing Entrez search term
+  # seqsPerFile = number of sequences to write to each FASTA file
+  # fastaFileName = character vector containing name you want to give to the FASTA files you are fetching
+  
+  # Initial search for finding maximum number of hits
+  search1 <- entrez_search(db = "nuccore", term = searchTerm)
+  # Second search for obtaining max number of hits and their IDs
+  search2 <- entrez_search(db = "nuccore", term = searchTerm, retmax = search1$count, use_history = T)
+  
+  # Fetch the sequences in FASTA format using the web_history object.
+  for (start_rec in seq(0, search2$retmax, seqsPerFile)) {
+    fname <- paste(fastaFileName, start_rec, ".fasta", sep = "")
+    recs <- entrez_fetch(db = "nuccore", web_history = search2$web_history, rettype = "fasta", retstart = start_rec, retmax = seqsPerFile)
+    write(recs, fname)
+    print(paste("Wrote records to ", fname, sep = ""))
+  }
+  
+  return(search2)
+  
+}
+
+#Runs the function to fetch sequences in FASTA format and saves it to a file
+#FetchFastaFiles(("Salmonella enterica"[Organism] AND 16S[Title]) AND "Salmonella enterica"[porgn]), seqsPerFile = 12000, "Samonella_")
+#FetchFastaFiles(("Escherichia coli"[Organism] AND 16S[Title]) AND "Escherichia coli"[porgn]), seqsPerFile = 1300, "Ecoli_") 
+#FetchFastaFiles(("Listeria"[Organism] AND 16S[Title]) AND "Listeria monocytogenes"[porgn]), seqsPerFile = 3100, "Listeria_") 
+
+```
+
+# Data Preprocessing
+```{r}
+ProcessSequences <- function(preSequencesList, organismNames) {
+  # This function takes a list of DNA sequences (preSequencesList) and a vector of organism names (organismNames).
+  # It processes each dataset and combines them into a single DataFrame.
+  
+  # Ensure the list of sequences and organism names are of the same length
+  if (length(preSequencesList) != length(organismNames)) {
+    stop("The number of datasets must match the number of organism names.")
+  }
+  
+  combinedData <- NULL  # Initialize an empty variable to hold the combined DataFrame
+  
+  # Loop over each dataset in the input list
+  for (i in seq_along(preSequencesList)) {
+    # Get the current dataset and corresponding organism name
+    preSequences <- preSequencesList[[i]]
+    organismName <- organismNames[i]
+    
+    # Filter sequences based on length
+    sequenceLength <- width(preSequences)
+    # Use top and bottom 10% to filter sequences for the current organism
+    qSeq <- quantile(sequenceLength, probs = c(0.1, 0.9))
+    bot10 <- qSeq[1]
+    top10 <- qSeq[2]
+    filteredSequences <- preSequences[sequenceLength >= bot10 & sequenceLength <= top10]  # Filter sequences within top and bottom 10% length range
+    
+    # Convert filtered sequences into a DataFrame and add gene identifier
+    df <- as.data.frame(filteredSequences)
+    colnames(df)[colnames(df) == "x"] <- "CNucleotides"  # Rename the character class column
+    df$gene <- organismName  # Add a new column to identify these sequences by the organism name
+    df$sNucleotides <- DNAStringSet(df$CNucleotides)  # Create a DNAStringSet column from CNucleotides
+    
+    # Add the current DataFrame to the combined dataset
+    combinedData <- if (is.null(combinedData)) {
+      df
+    } else {
+      rbind(combinedData, df)
+    }
+  }
+  
+  # Add sequence lengths to the combined DataFrame
+  combinedData$length <- width(combinedData$sNucleotides)
+  
+  # Calculate nucleotide frequencies for each sequence
+  combinedData <- cbind(combinedData, as.data.frame(letterFrequency(combinedData$sNucleotides, letters = c("A", "C", "G", "T"))))
+  
+  # Calculate proportions of each nucleotide
+  combinedData$Aprop <- combinedData$A / (combinedData$A + combinedData$T + combinedData$C + combinedData$G)
+  combinedData$Tprop <- combinedData$T / (combinedData$A + combinedData$T + combinedData$C + combinedData$G)
+  combinedData$Gprop <- combinedData$G / (combinedData$A + combinedData$T + combinedData$C + combinedData$G)
+  combinedData$Cprop <- combinedData$C / (combinedData$A + combinedData$T + combinedData$C + combinedData$G)
+  
+  # Calculate dinucleotide and trinucleotide frequencies for each sequence
+  combinedData <- cbind(combinedData, as.data.frame(dinucleotideFrequency(combinedData$sNucleotides, as.prob = TRUE)))
+  combinedData <- cbind(combinedData, as.data.frame(trinucleotideFrequency(combinedData$sNucleotides, as.prob = TRUE)))
+  
+  # Return the final combined DataFrame
+  return(combinedData)
+}
+
+#Load in FASTA files
+preEcoli<- readDNAStringSet("../FINAL PROJECT/data/ecoli.fasta")
+preSalmonella<- readDNAStringSet("../FINAL PROJECT/data/salmonella.fasta")
+```
+
+
+```{r}
+preListeria<- readDNAStringSet("../FINAL PROJECT/data/listeria.fasta")
+
+#List species for function
+preSequencesList <- list(preEcoli, preSalmonella, preListeria)
+organismNames <- c("Ecoli", "Salmonella", "Listeria")
+
+#Run the function
+dfcombined <- ProcessSequences(preSequencesList, organismNames)
+
+#View number of samples remain after filtering 
+summary(dfcombined$gene == "Ecoli")
+summary(dfcombined$gene == "Listeria")
+summary(dfcombined$gene == "Salmonella")
+
+#From the table we see that the total number of sequence for E. coli decrease from 11,801 to 9,444, Listeria decreased from 1,237 to 1,036 and Salmonella decreased from 3,063 to 2,499. This is because we removed the extremities (Bottom 10% and Top 90%) to ensure our data does not contain any outliers which could negatively impact our model's accuracy
+```
+
+```{r}
+#Development of Histogram to see sequence length distrubition 
+dfHist <- dfcombined[, c("length", "gene")]
+
+ggplot(dfHist, aes(x = length, fill = gene)) +
+  geom_histogram(bins = 30, color = "black", alpha = 0.7) +  # Histogram with color and border
+  facet_grid(. ~ gene) +  # Create separate graphs for BRCA1 and BRCA2
+  labs(title = "Sequence Length Distribution of Ecoli, Listeria and Salmonella",
+       x = "Sequence Length", y = "Frequency") +  # Add titles and axis labels
+  scale_fill_manual(values = c("Ecoli" = "red", "Listeria" = "green", "Salmonella" = "blue")) +  # Custom colors for each gene
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),    # Center and size the plot title
+    axis.title = element_text(size = 12),                 # Axis title size
+    axis.text = element_text(size = 10)                   # Axis text size
+  )
+
+```
+
+Figure 1. Histogram showing the sequence length distribution across E,coli, Listeria and Salmonella datasets. 
+
+The histogram reveals that E. coli sequences have longer 16S rRNA lengths, Listeria sequences have medium lengths, and Salmonella sequences are shorter. However, the higher frequency of E. coli data creates an imbalance, potentially biasing the model towards E. coli and reducing predictive performance. To address this, the dataset will be balanced by sampling an equal number of sequences for each species, ensuring fair and reliable model predictions.
+
+```{r}
+dfPCA <- dfcombined[, 9:92]
+
+#Perform PCA on the interger/numerics columns
+pca_result <- prcomp(dfPCA, center = TRUE, scale. = TRUE)
+
+#Create a dataframe with the PCA results and the associated gene labels
+pca_data <- data.frame(PC1 = pca_result$x[, 1], PC2 = pca_result$x[, 2], gene = dfcombined$gene)
+
+#Plot the PCA using ggplot2
+ggplot(pca_data, aes(x = PC1, y = PC2, color = gene)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of Ecoli, Listeria and Salmonella",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10))
+```
+
+Figure 2: Principal Component Analysis (PCA) of 16S rRNA sequence data for E. coli (red), Listeria (green), and Salmonella (blue).
+
+There is significant overlap between the groups, highlighting potential challenges in classification due to similarities in their sequence features. This overlap could lead to false positives and false negatives when distinguishing between the genes.
+
+```{r}
+#Splitting the data into training and validation sets. Each set contains an equal amount of sequences. 
+
+#Convert sNucleotide as character or else vec_size in sample_n() wont work
+dfModel<- dfcombined %>%
+  mutate(sNucleotides = as.character(sNucleotides))
+
+#Development of Validation set consisting of 50 samples from each gene
+set.seed(123) 
+dfValidation <- dfModel %>%
+  group_by(gene) %>%
+  sample_n(150)
+# Set seed so when sample_n() randomly selects, it would select the same one 
+
+#Development of Training set consisting of 50 samples from each gene
+set.seed(321)
+dfTraining <-dfModel %>%
+  filter(!CNucleotides %in% dfValidation$CNucleotides) %>% #Do not select the same data that is in training_set 
+  group_by(gene) %>%
+  sample_n(750)
+#Set seed so when sample_n() randomly selects, it would select the same one 
+
+#Verify the result
+table(dfValidation$gene)
+table(dfTraining$gene)
+
+#Ensure datasets are ungrouped
+dfTraining <- dfTraining %>% ungroup()
+dfValidation <- dfValidation %>% ungroup()
+
+#Ensure labels are factors
+dfTraining$gene <- as.factor(dfTraining$gene)
+dfValidation$gene <- as.factor(dfValidation$gene)
+
+#Select numeric predictors for both models
+train_features <- dfTraining %>% select(where(is.numeric)) %>% as.matrix()
+validation_features <- dfValidation %>% select(where(is.numeric)) %>% as.matrix()
+
+#As Listeria contains the least number of samples, the dataset was balanced by sampling an equal number of sequences for all three species. This approach ensures fairness in model training and evaluation, reducing the likelihood of bias toward the species with a larger number of samples (E. coli and Salmonella).
+```
+# Main Software Tools Description
+The main software tools used in this project are the machine learning packages: caret, randomForest, class, and gbm. These tools were chosen for their robust algorithms, flexible evaluation methods, and seamless data integration. The caret package (Kuhn, 2008) simplifies model training and evaluation by unifying workflows across algorithms. The randomForest package (Liaw & Wiener, 2002) builds decision-tree ensembles using bootstrap sampling and random feature selection to reduce overfitting while improving classification accuracy. The gbm package (Ridgeway, 2007) implements gradient boosting, combining weak learners iteratively to minimize classification error, with adjustable hyperparameters for optimizing model performance. The class package (Ripley et al., 2023) provides functions for implementing k-Nearest Neighbors (k-NN), a non-parametric classification algorithm. k-NN works by assigning a class label to a data point based on the majority vote of its k-nearest neighbors in the feature space, making it particularly effective for simple and interpretable classification tasks.
+
+
+```{r}
+#Random Forest Model Development 
+ModelRF <- randomForest::randomForest(x = dfTraining[, 9:92], y = as.factor(dfTraining$gene), ntree = 200, importance = TRUE)
+ValidationRF <- predict(ModelRF, dfValidation[, c(5:92)])
+RF_CM <- confusionMatrix(factor(ValidationRF), factor(dfValidation$gene))
+RF_CM
+
+#The parameters for the random forest model were picked based on the previous work done by Derick Liang. It was found that by using nucleotide and polynucleotide data the model produced better predictions. Furthermore, with 200 trees, it produced highly accurate results while not being computationally expensive. 
+```
+
+```{r}
+#Determining the optimal number of K
+KNN_Train_labels <- dfTraining$gene
+KNN_validation_labels <- dfValidation$gene
+
+k_values <- seq(1, 20, 2)  # Test odd values of k from 1 to 20
+accuracy <- numeric(length(k_values))  # Store accuracy for each k
+
+# Loop through k values
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  
+  # Perform k-NN classification
+  knn_predictions <- knn(
+    train = train_features,
+    test = validation_features,
+    cl = KNN_Train_labels,
+    k = k
+  )
+  
+  # Calculate accuracy
+  accuracy[i] <- mean(knn_predictions == KNN_validation_labels)
+}
+
+# Identify the optimal k
+optimal_k <- k_values[which.max(accuracy)]
+
+# Plot accuracy vs k
+plot(k_values, accuracy, type = "b", pch = 19, col = "blue",
+     xlab = "Number of Neighbors (k)", ylab = "Accuracy",
+     main = "Optimal k Selection")
+abline(v = optimal_k, col = "red", lty = 2)
+```
+
+Figure 3. Optimal k-value selection for the k-Nearest Neighbors (k-NN) model based on accuracy. 
+
+The plot displays the accuracy of the model for different values of k (number of neighbors). The highest accuracy is achieved at k=1, as indicated by the red dashed line. Beyond this point, accuracy decreases as k increases, suggesting k=1 is the optimal choice for this dataset.
+
+
+```{r} 
+## K-nn Model Development
+k <- 1
+knn_predictions <- knn(
+  train = train_features,
+  test = validation_features,
+  cl = dfTraining$gene,
+  k = k
+)
+
+# Evaluate k-NN
+KNN_CM <- confusionMatrix(data = knn_predictions, reference = dfValidation$gene)
+KNN_CM
+
+# Using the optimal K, a K-NN model was made. The accuracy of it's prediction is lower than the random forest model. 
+```
+
+```{r}
+## Logistic Regression Model development
+
+# Prepare data for GBM (Ensure it is a data frame)
+dfTraining_GBM <- data.frame(gene = dfTraining$gene, train_features)
+dfValidation_GBM <- data.frame(gene = dfValidation$gene, validation_features)
+
+# Fit the GBM Model
+set.seed(123)  # For reproducibility
+gbm_model <- gbm(
+  formula = gene ~ ., 
+  distribution = "multinomial", 
+  data = dfTraining_GBM, 
+  n.trees = 500,         # Number of trees
+  interaction.depth = 3, # Depth of each tree
+  shrinkage = 0.02,      # Learning rate
+  n.minobsinnode = 10,   # Minimum number of samples in terminal nodes
+  cv.folds = 5,          # 5-fold cross-validation
+  verbose = FALSE
+)
+
+# Determine the optimal number of trees using cross-validation
+best_trees <- gbm.perf(gbm_model, method = "cv")
+
+# Predict on the validation set (Ensure newdata is a data frame)
+validation_features_df <- data.frame(validation_features)  # Convert matrix to data frame
+colnames(validation_features_df) <- colnames(train_features)  # Ensure column names match
+
+gbm_predictions <- predict(
+  gbm_model, 
+  newdata = validation_features_df, 
+  n.trees = best_trees, 
+  type = "response"
+)
+
+# Convert predictions to class labels
+gbm_class_predictions <- apply(gbm_predictions, 1, which.max)
+gbm_class_predictions <- factor(gbm_class_predictions, labels = levels(dfTraining$gene))
+
+# Evaluate the GBM Model
+GBM_CM <- confusionMatrix(data = gbm_class_predictions, reference = dfValidation$gene)
+GBM_CM
+
+# The optimal number of trees was determined using cross-validation, as represented by the green line in the GBM model graph, which shows the cross-validated error for each iteration. It was found to be 469 trees which was then used to develop the model. The validation set was used to test the accuracy of the model. It showed similar prediction accuracy to random forest with a 98% accuracy rate. 
+```
+
+Figure 4. Cross-validation plot for the Gradient Boosting Machine (GBM) model showing multinomial deviance as a function of the number of iterations (trees).
+
+The green line represents the cross-validated deviance, while the black line indicates the training deviance. The optimal number of trees, as determined by the lowest cross-validated deviance, is marked by the blue dashed line at 469 iterations. This indicates the point where further iterations do not improve model performance significantly.
+
+```{r}
+#Visualize and Compare all the results 
+
+# Create a summary table
+models <- c("Random Forest", "K-NN", "GBM")
+
+accuracies <- c(
+  RF_CM$overall["Accuracy"],
+  KNN_CM$overall["Accuracy"],
+  GBM_CM$overall["Accuracy"]
+)
+
+mcnemar_p_values <- c(
+  RF_CM$overall["McnemarPValue"],
+  KNN_CM$overall["McnemarPValue"],
+  GBM_CM$overall["McnemarPValue"]
+)
+
+comparison_table <- data.frame(
+  Model = models,
+  Accuracy = accuracies,
+  McNemar_P_Value = mcnemar_p_values
+)
+
+# Reshape the data for plotting
+comparison_data <- comparison_table %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value")
+
+# Create a grouped bar chart with accuracy and McNemar's P-Value
+library(ggplot2)
+ggplot(comparison_data, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(
+    aes(label = ifelse(Metric == "Accuracy", round(Value, 4), round(Value, 3))), 
+    vjust = -0.5, 
+    position = position_dodge(0.9),
+    size = 3
+  ) +
+  scale_fill_viridis_d() +
+  labs(
+    title = "Model Comparison: Accuracy and McNemar's Test P-Value",
+    x = "Model",
+    y = "Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+Figure 5. Comparison of model performance metrics for Gradient Boosting Machines (GBM), k-Nearest Neighbors (k-NN), and Random Forest.
+
+The purple bars represent the classification accuracy for each model, with GBM achieving the highest accuracy (98%), followed closely by Random Forest (97.78%) and k-NN (79.33%). The yellow bars indicate the McNemar's Test P-Values, which assess the symmetry of misclassification errors. The values suggest no significant bias in classification errors across models, with all p-values above the typical significance threshold (0.05).
+
+# Discussion
+This study aimed to identify the most effective machine learning model for classifying Escherichia coli, Listeria monocytogenes, and Salmonella enterica using 16S rRNA sequence data. By evaluating Random Forest, k-Nearest Neighbors (k-NN), and Gradient Boosting Machines (GBM), the results revealed that GBM achieved the highest accuracy (98%), followed closely by Random Forest (97.78%). In contrast, k-NN exhibited lower performance with an accuracy of 79.33%. McNemar’s test was used to assess the symmetry of classification errors, providing insight into whether the models' errors were balanced across different classes. The p-values from McNemar’s test indicated no significant bias in the classification errors for any of the models (p > 0.05 for all), suggesting that the misclassifications were distributed evenly across species. 
+
+  Unfortunatly, this study has limitations. Training models exclusively on 16S rRNA gene sequences may not capture the full genomic diversity necessary for accurately distinguishing closely related bacterial species. Incorporating additional conserved genes, such as gyrB and rpoB, can enhance phylogenetic resolution and improve classification accuracy. For instance, a study published in Frontiers in Microbiology demonstrated that the gyrB gene serves as a powerful molecular marker for differentiating closely related genera, providing higher resolution than the 16S rRNA gene (Liu et al., 2021) Similarly, the rpoB gene has been recognized for its utility in analyzing bacterial diversity, offering more precise insights into microbial communities (Ogier et al., 2019). Therefore, integrating multiple conserved genes into the training data could significantly enhance the robustness and accuracy of bacterial classification models.
+
+  Future research could expand on this study by incorporating larger and more diverse datasets to improve generalizability. Furthermore, integrating other genomic features, such as whole-genome sequencing data, could provide greater insights and improve model robustness for distinguishing closely related bacterial species. Another direction would be to explore hybrid models that combine the strengths of different machine learning approaches. For example, ensemble methods like GBM could be combined with deep learning models to capture both feature-level variations and complex nonlinear relationships. Alternatively, combining k-NN with Random Forest could leverage the interpretability of k-NN while benefiting from Random Forest's ability to handle high-dimensional data. These hybrid approaches could potentially lead to improved classification accuracy and robustness in complex bacterial classification tasks.
+
+# Reflection 
+During my time in BINF6210, I have develop strong analytical and machine learning skills. Through completing my small project and assignment throughout the course, I was able to practice my data cleaning, analysis and visualization as I work with raw data and tried to transform it into something meaningful. Furthermore, with a strong interest in machine learning, this course allowed me to learn and practice my machine learning development skills. I learned about new packages and models that can be used to assess biological data. As I move forward with future coursework, including BINF6999 or my thesis, I aim to build on these skills by exploring more advanced machine learning models and tools, such as neural networks or multi-omics data integration methods. For my graduate program and future career, I plan to further develop my ability to communicate complex findings clearly, both visually and in writing, as these are critical for collaborative research and industry roles. I hope to work on larger projects with a group, as collaboration provides an opportunity to learn from others, share ideas and tackle complex problems more effectively.
+
+# Acknowlegements 
+I would like to thank Karl Cottenie for providing example code to assist in developing my analysis. Furthermore, I would like to thank him for being a wonderful and kind professor in the class of BINF*6210.
+
+I would like to thank Brittany MacIntyre for taking the time to read and provide feedback for all the long assignments to ensure we learn from our mistakes and build from them. Her kind and helpful nature has helped me better understand the assignments and strive to improve on each subsequent one.
+
+I would like to thank Frances and Rebecca Choi for moral support and staying up with me to work on this assignment.  
+
+I would like to thank Vivian Phung for suggesting ideas and putting up with my random noises. 
+
+I would like thank the developers of ChatGPT who provided the software for code debugging and clarification.
+
+
+# References 
+
+Bertolo, A., Valido, E., & Stoyanov, J. (2024). Optimized bacterial community characterization through full-length 16S rRNA gene sequencing utilizing MinION nanopore technology. BMC Microbiology, 24(1), 58. https://doi.org/10.1186/s12866-024-03208-5
+
+Liaw A, Wiener M (2002). “Classification and Regression by randomForest.” R News, 2(3), 18-22. https://CRAN.R-project.org/doc/Rnews/.
+
+Liu, Y., Pei, T., Yi, S., Du, J., Zhang, X., Deng, X., Yao, Q., Deng, M.-R., & Zhu, H. (2021, September 22). Phylogenomic analysis substantiates the GYRB gene as a powerful molecular marker to efficiently differentiate the most closely related genera Myxococcus, Corallococcus, and pyxidicoccus. Frontiers. https://doi.org/10.3389/fmicb.2021.763359 
+
+Ogier, J.-C., Pag&egrave;s, S., Galan, M., Barret, M., & Gaudriault, S. (2019, July 29). RPOB, a promising marker for analyzing the diversity of bacterial communities by amplicon sequencing - BMC Microbiology. BioMed Central. https://bmcmicrobiol.biomedcentral.com/articles/10.1186/s12866-019-1546-z 
+
+Ridgeway, G., Edwards, D., Kriegler, B., Schroedl, S., Southworth, H., Greenwell, B., Boehmke, B., Cunningham, J., & GBM Developers. (2024). gbm: Generalized Boosted Regression Models (Version 2.2.2) [R package]. Comprehensive R Archive Network (CRAN). https://cran.r-project.org/package=gbm
+
+Sharma, D., Kraft, A. L., Owade, J. O., Milicevic, M., Yi, J., & Bergholz, T. M. (2024). Impact of Biotic and Abiotic Factors on Listeria monocytogenes, Salmonella enterica, and Enterohemorrhagic Escherichia coli in Agricultural Soil Extracts. Microorganisms, 12(7), 1498. https://doi.org/10.3390/microorganisms12071498
+
+Venables WN, Ripley BD (2002). Modern Applied Statistics with S, Fourth edition. Springer, New York. ISBN 0-387-95457-0, https://www.stats.ox.ac.uk/pub/MASS4/.
+
+Zieliński, B., Plichta, A., Misztal, K., Spurek, P., Brzychczy-Włoch, M., & Ochońska, D. (2017). Deep learning approach to bacterial colony classification. PLOS ONE, 12(9), e0184554. https://doi.org/10.1371/journal.pone.0184554
+
+
+
+
+
+
+
